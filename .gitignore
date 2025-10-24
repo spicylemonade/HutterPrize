@@ -1,0 +1,25 @@
+# Compiled artifacts
+*.o
+*.obj
+*.exe
+*.out
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build outputs
+comp
+archive
+archive.dev
+
+# Demo files
+sample.bin
+out.bin
+docs/results.tex
+docs/results.json
