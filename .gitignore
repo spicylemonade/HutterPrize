@@ -1,0 +1,24 @@
+# Build artifacts
+comp
+archive
+archive_stub
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.so
+build/
+.tmp/
+.cache/
+
+# Data artifacts
+enwik9
+enwik9.out
+enwik9.zip
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
