@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "dlz.h"
+#include "dict.h"
 
 static constexpr size_t IN_CHUNK  = 1 << 20; // 1 MiB
 static constexpr size_t OUT_CHUNK = 1 << 20; // 1 MiB
@@ -41,43 +42,17 @@ static uint32_t crc32_update(uint32_t crc, const unsigned char* data, size_t len
     crc ^= 0xFFFFFFFFu; for (size_t i = 0; i < len; ++i) crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8); return crc ^ 0xFFFFFFFFu;
 }
 
-// Static dictionary of common XML/Wikitext tokens (<=127 entries)
-static const char* const DICT[] = {
-    "<page>", "</page>", "<title>", "</title>", "<id>", "</id>",
-    "<revision>", "</revision>", "<timestamp>", "</timestamp>",
-    "<contributor>", "</contributor>", "<username>", "</username>",
-    "<minor/>", "<minor />", "<comment>", "</comment>",
-    "<model>wikitext</model>", "<format>text/x-wiki</format>",
-    "<ns>", "</ns>", "<siteinfo>", "</siteinfo>",
-    "<sitename>", "</sitename>", "<base>", "</base>",
-    "<generator>", "</generator>", "<case>", "</case>",
-    "<namespaces>", "</namespaces>", "<namespace key=\"", "</namespace>",
-    "<mediawiki", "</mediawiki>",
-    "<text xml:space=\"preserve\">", "</text>", "<text ",
-    "[[", "]]", "{{", "}}", "[[Category:", "[[File:", "[[Image:",
-    "<ref>", "</ref>", "<ref", "<!--", "-->",
-    "==", "===", "====", "{{cite", "{{citation", "|author", "|title",
-    "|url", "|publisher", "|date", "|accessdate", "|work", "|pages",
-    "|isbn", "|doi", "|issue", "|volume", "|journal", "|language",
-    "|archiveurl", "|archivedate", "|quote", "|trans-title", "|location",
-    "|ref", "|last", "|first",
-    // Additional common markers
-    "|year", "|month", "|day", "|access-date", "|access-date=",
-    "[[Category:", "{{Infobox", "{{infobox", "<redirect", "#REDIRECT"
-};
-static constexpr int DICT_SIZE = (int)(sizeof(DICT)/sizeof(DICT[0]));
-
 struct DictIndex {
     std::vector<int> heads[256];
     size_t maxLen = 0;
     DictIndex() {
-        for (int i = 0; i < DICT_SIZE; ++i) {
-            const unsigned char c = (unsigned char)DICT[i][0];
+        for (int i = 0; i < HPZ_DICT_SIZE; ++i) {
+            const unsigned char c = (unsigned char)HPZ_DICT[i][0];
             heads[c].push_back(i);
-            size_t L = std::strlen(DICT[i]); if (L > maxLen) maxLen = L;
+            size_t L = std::strlen(HPZ_DICT[i]); if (L > maxLen) maxLen = L;
         }
         for (int c = 0; c < 256; ++c) {
-            std::sort(heads[c].begin(), heads[c].end(), [](int a, int b){ return std::strlen(DICT[a]) > std::strlen(DICT[b]); });
+            std::sort(heads[c].begin(), heads[c].end(), [](int a, int b){ return std::strlen(HPZ_DICT[a]) > std::strlen(HPZ_DICT[b]); });
         }
         if (maxLen == 0) maxLen = 1;
     }
@@ -145,7 +120,7 @@ static bool sink_finish(Sink& s) {
 }
 
 // Reversible transform encoder with streaming output to sink
-// Tokens: 0x00 0x00 -> literal 0x00; 0x00 1..DICT_SIZE -> dictionary id
+// Tokens: 0x00 0x00 -> literal 0x00; 0x00 1..HPZ_DICT_SIZE -> dictionary id
 //         0x00 0x80 <L> -> space run of length (L+4)
 //         0x00 0x81 <L> -> newline run of length (L+2)
 //         0x00 0x82 <L> <digits...> -> digit run of length (L+3) followed by that many digit bytes
@@ -213,7 +188,7 @@ struct Encoder {
             const auto& cand = idx.heads[c];
             bool matched = false;
             for (int di : cand) {
-                const char* t = DICT[di]; size_t L = std::strlen(t);
+                const char* t = HPZ_DICT[di]; size_t L = std::strlen(t);
                 if (i + L <= block.size() && std::memcmp(s + i, t, L) == 0) {
                     emit_token((uint8_t)(di + 1)); i += L; matched = true; break;
                 }
@@ -328,11 +303,16 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Optional HPZT header when transforms enabled
+    // Optional HPZT header when transforms enabled (v2 with dict checksum)
     if (apply_transforms) {
-        unsigned char hdr[8]; hdr[0]='H'; hdr[1]='P'; hdr[2]='Z'; hdr[3]='T'; hdr[4]=1; // version
+        unsigned char hdr[12]; hdr[0]='H'; hdr[1]='P'; hdr[2]='Z'; hdr[3]='T'; hdr[4]=2; // version 2
         // flags: bit0=DICT, bit1=SPACE-RUN, bit2=NL-RUN, bit3=DIGIT-RUN
         hdr[5]=0x0F; hdr[6]=0; hdr[7]=0;
+        uint32_t dcrc = hpzt_dict_crc32();
+        hdr[8] = (unsigned char)((dcrc >> 0) & 0xFF);
+        hdr[9] = (unsigned char)((dcrc >> 8) & 0xFF);
+        hdr[10] = (unsigned char)((dcrc >> 16) & 0xFF);
+        hdr[11] = (unsigned char)((dcrc >> 24) & 0xFF);
         if (!sink_write(sink, hdr, sizeof(hdr))) { std::fprintf(stderr, "[ERROR] Writing transform header failed\n"); std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1; }
     }
 
@@ -374,7 +354,7 @@ int main(int argc, char** argv) {
     chmod(out_path, 0755);
     std::fprintf(stderr, "[OK] Created archive: %s\n", out_path);
     std::fprintf(stderr, " Method:     %s\n", method == METHOD_ZLIB ? "ZLIB" : "STORE");
-    std::fprintf(stderr, " Transforms: %s\n", apply_transforms ? "HPZT (dict,space,nl,digits)" : "none");
+    std::fprintf(stderr, " Transforms: %s\n", apply_transforms ? "HPZT v2 (dict,space,nl,digits,+checksum)" : "none");
     std::fprintf(stderr, " Original:   %llu bytes\n", (unsigned long long) total_in);
     std::fprintf(stderr, " Payload:    %llu bytes\n", (unsigned long long) total_out);
     return 0;

@@ -12,27 +12,29 @@
 \begin{document}
 \maketitle
 \begin{abstract}
-Iteration 5 extends the reversible streaming transform layer with newline and digit run encoding in addition to dictionary tokenization and space-run encoding. We add CLI knobs to choose the compression backend (zlib or store) and to toggle transforms. The build remains dependency-free (dynamic zlib is loaded at runtime if available), and the self-extracting archive continues to be a single binary that reproduces enwik9 bit-identically. These changes deliver measurable S2 gains with zlib and strengthen the pipeline for future integration of a stronger backend and advanced modeling.
+Iteration 1 fixes a correctness bug by unifying the dictionary into a shared header used by both encoder and decoder, removing a duplicated token that caused token ID skew. We also extend the HPZT transform header to version~2 with a 32-bit checksum over the dictionary which the decoder verifies before transform decoding, preventing future skew. The reversible streaming transforms (dictionary tokenization, space/newline/digit run encoding, and 0x00 escaping) remain strictly invertible. The backend remains zlib (dynamic) with STORE fallback.
 \end{abstract}
 
 \section{Self-Extracting Format}
-We concatenate a decompressor stub with a payload and an HPZ2 footer (magic, method byte, original size, payload size, CRC-32 of original). When transforms are enabled, the payload starts with an 8-byte HPZT header (magic ``HPZT'', version=1, flags) that declares active transforms.
+We concatenate a decompressor stub with a payload and an HPZ2 footer (magic, method byte, original size, payload size, CRC-32 of original). When transforms are enabled, the payload starts with an HPZT header, now version~2: \texttt{``HPZT''}, version=2, flags, and a 32-bit little-endian checksum over the shared dictionary (content and order). The decoder validates this checksum before decoding.
 
 \section{Transforms}
 \begin{itemize}[noitemsep]
-  \item Dictionary tokenization: frequent XML/Wikitext substrings are replaced by two-byte tokens (0x00, id).
-  \item Space-run encoding: runs of spaces of length \(\ge 4\) are replaced by 0x00, 0x80, len$-$4.
-  \item Newline-run encoding (new): runs of newlines of length \(\ge 2\) are replaced by 0x00, 0x81, len$-$2.
-  \item Digit-run encoding (new): runs of digits of length \(\ge 3\) are replaced by 0x00, 0x82, len$-$3 followed by the digit bytes (saving one byte per run and improving compressibility).
+  \item Dictionary tokenization: frequent XML/Wikitext substrings are replaced by two-byte tokens (0x00, id). The dictionary is defined once in \texttt{src/dict.h} and used by both encoder and decoder.
+  \item Space-run encoding: runs of spaces of length $\ge 4$ are replaced by 0x00, 0x80, len$-$4.
+  \item Newline-run encoding: runs of newlines of length $\ge 2$ are replaced by 0x00, 0x81, len$-$2.
+  \item Digit-run encoding: runs of digits of length $\ge 3$ are replaced by 0x00, 0x82, len$-$3 followed by the digit bytes.
   \item Escape: literal 0x00 is encoded as 0x00, 0x00.
 \end{itemize}
-All transforms are streaming and strictly reversible; decoding is driven by a simple finite-state machine.
+All transforms are streaming and strictly reversible; decoding is driven by a finite-state machine.
 
-\section{Compression Backend and CLI}
-We use dynamic zlib (loaded at runtime) when available and fall back to STORE otherwise. The compressor now supports:\\
-\texttt{--method=zlib|store} and \texttt{--no-transform}. This enables controlled experiments and ablations.
+\section{Backend and CLI}
+We use dynamic zlib (loaded at runtime) with STORE fallback. The compressor supports \texttt{--method=zlib|store} and \texttt{--no-transform} for ablations.
+
+\section{Correctness and Guardrails}
+The duplicate token in the encoder dictionary caused an ID shift; unifying the dictionary removes the skew. HPZT v2 carries a dictionary checksum (CRC-32 over NUL-terminated strings and dictionary size). The decoder rejects payloads whose checksum does not match the built-in dictionary, guarding against accidental drift.
 
 \section{Roadmap}
-Next iterations will vendor a stronger bundled backend (e.g., LZMA or a static entropy coder) and introduce additional reversible transforms (numeric/date canonicalization and structural tagging), then integrate a context-mixing model. The final paper will include detailed ablations.
+Next iterations will add unit tests for transform round-trips (including chunk boundary cases), and integrate a stronger backend (context mixing or similar). We will also extend reversible structural transforms specific to Wikitext/XML.
 
 \end{document}

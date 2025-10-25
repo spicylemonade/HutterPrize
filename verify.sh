@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-./build.sh
+bash ./build.sh
 
 # Acquire data if missing
 if [ ! -f enwik9 ]; then
