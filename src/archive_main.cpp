@@ -5,9 +5,11 @@
 #include <cerrno>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "dlz.h"
+#include "transform_dict.h"
 
 #if defined(__linux__)
 #include <limits.h>
@@ -15,6 +17,13 @@
 
 static constexpr size_t IN_CHUNK  = 1 << 20; // 1 MiB
 static constexpr size_t OUT_CHUNK = 1 << 20; // 1 MiB
+
+// Transform flags (bit positions)
+static constexpr uint8_t TFLAG_DICT  = 1u << 0;
+static constexpr uint8_t TFLAG_SPACE = 1u << 1;
+static constexpr uint8_t TFLAG_NL    = 1u << 2;
+static constexpr uint8_t TFLAG_DIGIT = 1u << 3;
+static constexpr uint8_t TFLAG_HEX   = 1u << 4;
 
 enum Method : uint8_t { METHOD_STORE = 0, METHOD_ZLIB = 1 };
 
@@ -37,60 +46,75 @@ static uint32_t crc32_update(uint32_t crc, const unsigned char* data, size_t len
     crc ^= 0xFFFFFFFFu; for (size_t i = 0; i < len; ++i) crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8); return crc ^ 0xFFFFFFFFu;
 }
 
-// Same dictionary as compressor
-static const char* const DICT[] = {
-    "<page>", "</page>", "<title>", "</title>", "<id>", "</id>",
-    "<revision>", "</revision>", "<timestamp>", "</timestamp>",
-    "<contributor>", "</contributor>", "<username>", "</username>",
-    "<minor/>", "<minor />", "<comment>", "</comment>",
-    "<model>wikitext</model>", "<format>text/x-wiki</format>",
-    "<ns>", "</ns>", "<siteinfo>", "</siteinfo>",
-    "<sitename>", "</sitename>", "<base>", "</base>",
-    "<generator>", "</generator>", "<case>", "</case>",
-    "<namespaces>", "</namespaces>", "<namespace key=\"", "</namespace>",
-    "<mediawiki", "</mediawiki>",
-    "<text xml:space=\"preserve\">", "</text>", "<text ",
-    "[[", "]]", "{{", "}}", "[[Category:", "[[File:", "[[Image:",
-    "<ref>", "</ref>", "<ref", "<!--", "-->",
-    "==", "===", "====", "{{cite", "{{citation", "|author", "|title",
-    "|url", "|publisher", "|date", "|accessdate", "|work", "|pages",
-    "|isbn", "|doi", "|issue", "|volume", "|journal", "|language",
-    "|archiveurl", "|archivedate", "|quote", "|trans-title", "|location",
-    "|ref", "|last", "|first",
-    "|year", "|month", "|day", "|access-date", "|access-date=",
-    "[[Category:", "{{Infobox", "{{infobox", "<redirect", "#REDIRECT"
-};
-static constexpr int DICT_SIZE = (int)(sizeof(DICT)/sizeof(DICT[0]));
+// Compute a checksum of the shared dictionary (strings + NUL separators)
+static uint32_t hpzt_dict_crc32() {
+    uint32_t c = 0u;
+    for (int i = 0; i < HPZT_DICT_SIZE; ++i) {
+        const unsigned char* s = (const unsigned char*)HPZT_DICT[i];
+        size_t L = std::strlen(HPZT_DICT[i]);
+        c = crc32_update(c, s, L + 1);
+    }
+    return c;
+}
 
 struct TransformDecoder {
     // Header parsing
-    unsigned char hdr[8]; size_t hdr_pos = 0; bool header_done = false; bool transforms = false;
+    unsigned char hdr[12]; size_t hdr_pos = 0; size_t hdr_need = 8; bool header_done = false; bool transforms = false; bool have_magic = false; bool verified = false; uint8_t flags_mask = 0;
     // Escape decoding state machine
-    enum EscState { ESC_NONE=0, ESC_SEEN00=1, ESC_SPACE=2, ESC_NL=3, ESC_DIGIT_LEN=4, ESC_DIGIT_COPY=5 };
-    EscState esc = ESC_NONE; size_t digit_left = 0;
+    enum EscState { ESC_NONE=0, ESC_SEEN00=1, ESC_SPACE=2, ESC_NL=3, ESC_DIGIT_LEN=4, ESC_DIGIT_COPY=5, ESC_HEX_LEN=6, ESC_HEX_COPY=7 };
+    EscState esc = ESC_NONE; size_t copy_left = 0;
 
-    void reset() { hdr_pos = 0; header_done = false; transforms = false; esc = ESC_NONE; digit_left = 0; }
+    void reset() { hdr_pos = 0; hdr_need = 8; header_done = false; transforms = false; have_magic = false; verified = false; flags_mask = 0; esc = ESC_NONE; copy_left = 0; }
 
     bool feed(const unsigned char* in, size_t n, FILE* fout, uint32_t& crc, uint64_t& written) {
         size_t i = 0;
         while (i < n) {
             // Header state
             if (!header_done) {
+                // Accumulate first 4 bytes to check magic
                 while (hdr_pos < 4 && i < n) hdr[hdr_pos++] = in[i++];
-                if (hdr_pos >= 4 && !header_done) {
+                if (hdr_pos >= 4 && !have_magic) {
+                    have_magic = true;
                     if (!(hdr[0]=='H' && hdr[1]=='P' && hdr[2]=='Z' && hdr[3]=='T')) {
                         // No header: passthrough accumulated hdr bytes
                         if (std::fwrite(hdr, 1, hdr_pos, fout) != hdr_pos) return false;
                         crc = crc32_update(crc, hdr, hdr_pos); written += hdr_pos;
                         header_done = true; transforms = false; // passthrough mode
-                        // continue processing remaining in passthrough mode in same call
-                    } else {
-                        // HPZT present: need 4 more bytes (ver, flags, pad)
-                        while (hdr_pos < 8 && i < n) hdr[hdr_pos++] = in[i++];
-                        if (hdr_pos < 8) return true;
-                        header_done = true; transforms = (hdr[5] & 0x0F) != 0;
+                    }
+                }
+                if (!header_done && have_magic) {
+                    // Need version/flags first
+                    while (hdr_pos < 8 && i < n) hdr[hdr_pos++] = in[i++];
+                    if (hdr_pos < 8) return true;
+                    unsigned char ver = hdr[4];
+                    // Only versions 1 and 2 are recognized; otherwise treat as passthrough
+                    if (!(ver == 1 || ver == 2)) {
+                        if (std::fwrite(hdr, 1, hdr_pos, fout) != hdr_pos) return false;
+                        crc = crc32_update(crc, hdr, hdr_pos); written += hdr_pos;
+                        header_done = true; transforms = false;
                         continue;
                     }
+                    flags_mask = hdr[5] & 0x1F; // up to 5 transforms supported
+                    hdr_need = (ver >= 2) ? 12 : 8;
+                    while (hdr_pos < hdr_need && i < n) hdr[hdr_pos++] = in[i++];
+                    if (hdr_pos < hdr_need) return true;
+                    // Header complete
+                    if (hdr_need == 12) {
+                        uint32_t sent_crc = read_le32(hdr + 8);
+                        if (flags_mask & TFLAG_DICT) {
+                            uint32_t want_crc = hpzt_dict_crc32();
+                            if (sent_crc != want_crc) {
+                                std::fprintf(stderr, "[ERROR] Dictionary checksum mismatch (header=0x%08x, local=0x%08x).\n", sent_crc, want_crc);
+                                return false;
+                            }
+                        }
+                        verified = true;
+                    } else {
+                        verified = true; // v1 has no checksum
+                    }
+                    transforms = (flags_mask != 0);
+                    header_done = true;
+                    continue;
                 }
                 if (!header_done) continue;
             }
@@ -107,35 +131,69 @@ struct TransformDecoder {
                 if (b == 0x00) {
                     unsigned char z = 0x00; if (std::fwrite(&z, 1, 1, fout) != 1) return false; crc = crc32_update(crc, &z, 1); ++written; esc = ESC_NONE;
                 } else if (b == 0x80) {
+                    if (!(flags_mask & TFLAG_SPACE)) { std::fprintf(stderr, "[ERROR] SPACE token encountered but SPACE transform not enabled.\n"); return false; }
                     esc = ESC_SPACE;
                 } else if (b == 0x81) {
+                    if (!(flags_mask & TFLAG_NL)) { std::fprintf(stderr, "[ERROR] NL token encountered but NL transform not enabled.\n"); return false; }
                     esc = ESC_NL;
                 } else if (b == 0x82) {
+                    if (!(flags_mask & TFLAG_DIGIT)) { std::fprintf(stderr, "[ERROR] DIGIT token encountered but DIGIT transform not enabled.\n"); return false; }
                     esc = ESC_DIGIT_LEN;
-                } else if (b >= 1 && b <= DICT_SIZE) {
-                    const char* s = DICT[b - 1]; size_t L = std::strlen(s);
-                    if (L) { if (std::fwrite(s, 1, L, fout) != L) return false; crc = crc32_update(crc, (const unsigned char*)s, L); written += L; }
+                } else if (b == 0x83) {
+                    if (!(flags_mask & TFLAG_HEX)) { std::fprintf(stderr, "[ERROR] HEX token encountered but HEX transform not enabled.\n"); return false; }
+                    esc = ESC_HEX_LEN;
+                } else if (b >= 1 && b <= HPZT_DICT_SIZE) {
+                    if (!(flags_mask & TFLAG_DICT)) { std::fprintf(stderr, "[ERROR] DICT token encountered but DICT transform not enabled.\n"); return false; }
+                    const char* s = HPZT_DICT[b - 1]; size_t L = std::strlen(s);
+                    if (L) {
+                        if (std::fwrite(s, 1, L, fout) != L) return false;
+                        crc = crc32_update(crc, (const unsigned char*)s, L);
+                        written += L;
+                    }
                     esc = ESC_NONE;
                 } else {
                     std::fprintf(stderr, "[ERROR] Invalid transform token: 0x%02x\n", b); return false;
                 }
             } else if (esc == ESC_SPACE) {
                 size_t run = (size_t)b + 4; std::vector<unsigned char> sp(run, (unsigned char)' ');
-                if (!sp.empty()) { if (std::fwrite(sp.data(), 1, sp.size(), fout) != sp.size()) return false; crc = crc32_update(crc, sp.data(), sp.size()); written += sp.size(); }
+                if (!sp.empty()) {
+                    if (std::fwrite(sp.data(), 1, sp.size(), fout) != sp.size()) return false;
+                    crc = crc32_update(crc, sp.data(), sp.size());
+                    written += sp.size();
+                }
                 esc = ESC_NONE;
             } else if (esc == ESC_NL) {
                 size_t run = (size_t)b + 2; std::vector<unsigned char> nl(run, (unsigned char)'\n');
-                if (!nl.empty()) { if (std::fwrite(nl.data(), 1, nl.size(), fout) != nl.size()) return false; crc = crc32_update(crc, nl.data(), nl.size()); written += nl.size(); }
+                if (!nl.empty()) {
+                    if (std::fwrite(nl.data(), 1, nl.size(), fout) != nl.size()) return false;
+                    crc = crc32_update(crc, nl.data(), nl.size());
+                    written += nl.size();
+                }
                 esc = ESC_NONE;
             } else if (esc == ESC_DIGIT_LEN) {
-                digit_left = (size_t)b + 3; esc = ESC_DIGIT_COPY;
+                copy_left = (size_t)b + 3; esc = ESC_DIGIT_COPY;
             } else if (esc == ESC_DIGIT_COPY) {
-                size_t can = std::min(digit_left, n - (i - 1)); // include current b already fetched
-                // We already consumed one byte into b; put it back logically
+                size_t can = std::min(copy_left, n - (i - 1));
                 i--; // step back to include b in bulk copy
                 const unsigned char* src = in + i;
-                if (std::fwrite(src, 1, can, fout) != can) return false; crc = crc32_update(crc, src, can); written += can; i += can; digit_left -= can;
-                if (digit_left == 0) esc = ESC_NONE;
+                if (std::fwrite(src, 1, can, fout) != can) return false;
+                crc = crc32_update(crc, src, can);
+                written += can;
+                i += can;
+                copy_left -= can;
+                if (copy_left == 0) esc = ESC_NONE;
+            } else if (esc == ESC_HEX_LEN) {
+                copy_left = (size_t)b + 3; esc = ESC_HEX_COPY;
+            } else if (esc == ESC_HEX_COPY) {
+                size_t can = std::min(copy_left, n - (i - 1));
+                i--; // step back to include b in bulk copy
+                const unsigned char* src = in + i;
+                if (std::fwrite(src, 1, can, fout) != can) return false;
+                crc = crc32_update(crc, src, can);
+                written += can;
+                i += can;
+                copy_left -= can;
+                if (copy_left == 0) esc = ESC_NONE;
             }
         }
         return true;
