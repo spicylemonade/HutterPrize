@@ -1,0 +1,40 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{enumitem}
+\title{Towards a New Hutter Prize Record on enwik9: System Design and Implementation}
+\author{HutterPrize Solver Authors}
+\date{\today}
+\begin{document}
+\maketitle
+\begin{abstract}
+We fix correctness via a shared dictionary and an HPZT v2 checksum, and add per-transform flags selectable at compression time and enforced at decompression time. The streaming transform layer supports dictionary tokenization, space/newline/digit run encoding, and 0x00 escaping. The compressor uses dynamic zlib with a STORE fallback; verification includes unit-like round-trip tests and transform ablations. These steps harden the pipeline and make ablations reproducible, preparing for a stronger backend.
+\end{abstract}
+
+\section{Self-Extracting Format}
+The archive is [decompressor stub] + [payload] + HPZ2 footer. When transforms are used, the payload begins with an HPZT header.
+
+\paragraph{HPZT v2 Header} Magic ``HPZT'', version=2, flags bitmask, padding, and a 32-bit little-endian checksum of the shared dictionary (including NUL separators). The decoder validates the checksum if the dictionary transform is enabled.
+
+\section{Transforms and Flags}
+Enabled transforms are encoded in the HPZT header flags and strictly enforced by the decoder:
+\begin{itemize}[noitemsep]
+  \item dict: frequent XML/Wikitext substrings as two-byte tokens.
+  \item space: runs of spaces of length $\ge 4$ encoded compactly.
+  \item nl: runs of newlines of length $\ge 2$ encoded compactly.
+  \item digits: runs of digits of length $\ge 3$, followed by the digits themselves.
+  \item escape: literal 0x00 encoded as 0x00, 0x00.
+\end{itemize}
+Flags can be selected via \texttt{--transforms=LIST} where LIST is \texttt{all} (default), \texttt{none}, or a comma-separated subset of \{dict, space, nl, digits\}. The decoder rejects any token inconsistent with the header flags.
+
+\section{CLI and Verification}
+We support \texttt{--method=zlib|store}, \texttt{--no-transform}, and \texttt{--transforms=LIST}. The verification script runs STORE/ZLIB round-trip tests on crafted inputs including chunk-boundary cases, and executes transform ablations to ensure decoder/encoder consistency.
+
+\section{Roadmap}
+Next iterations will integrate a stronger backend (context mixing or advanced entropy modeling) and richer reversible preprocessing (structural tagging, canonicalization) to target record-level compression.
+
+\end{document}
