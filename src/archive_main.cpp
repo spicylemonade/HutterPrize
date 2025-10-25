@@ -5,9 +5,11 @@
 #include <cerrno>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "dlz.h"
+#include "dict.h"
 
 #if defined(__linux__)
 #include <limits.h>
@@ -37,60 +39,52 @@ static uint32_t crc32_update(uint32_t crc, const unsigned char* data, size_t len
     crc ^= 0xFFFFFFFFu; for (size_t i = 0; i < len; ++i) crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8); return crc ^ 0xFFFFFFFFu;
 }
 
-// Same dictionary as compressor
-static const char* const DICT[] = {
-    "<page>", "</page>", "<title>", "</title>", "<id>", "</id>",
-    "<revision>", "</revision>", "<timestamp>", "</timestamp>",
-    "<contributor>", "</contributor>", "<username>", "</username>",
-    "<minor/>", "<minor />", "<comment>", "</comment>",
-    "<model>wikitext</model>", "<format>text/x-wiki</format>",
-    "<ns>", "</ns>", "<siteinfo>", "</siteinfo>",
-    "<sitename>", "</sitename>", "<base>", "</base>",
-    "<generator>", "</generator>", "<case>", "</case>",
-    "<namespaces>", "</namespaces>", "<namespace key=\"", "</namespace>",
-    "<mediawiki", "</mediawiki>",
-    "<text xml:space=\"preserve\">", "</text>", "<text ",
-    "[[", "]]", "{{", "}}", "[[Category:", "[[File:", "[[Image:",
-    "<ref>", "</ref>", "<ref", "<!--", "-->",
-    "==", "===", "====", "{{cite", "{{citation", "|author", "|title",
-    "|url", "|publisher", "|date", "|accessdate", "|work", "|pages",
-    "|isbn", "|doi", "|issue", "|volume", "|journal", "|language",
-    "|archiveurl", "|archivedate", "|quote", "|trans-title", "|location",
-    "|ref", "|last", "|first",
-    "|year", "|month", "|day", "|access-date", "|access-date=",
-    "[[Category:", "{{Infobox", "{{infobox", "<redirect", "#REDIRECT"
-};
-static constexpr int DICT_SIZE = (int)(sizeof(DICT)/sizeof(DICT[0]));
-
 struct TransformDecoder {
     // Header parsing
-    unsigned char hdr[8]; size_t hdr_pos = 0; bool header_done = false; bool transforms = false;
+    unsigned char hdr[16]; size_t hdr_pos = 0; size_t hdr_need = 8; bool header_done = false; bool transforms = false; bool have_magic = false; uint8_t flags = 0;
     // Escape decoding state machine
-    enum EscState { ESC_NONE=0, ESC_SEEN00=1, ESC_SPACE=2, ESC_NL=3, ESC_DIGIT_LEN=4, ESC_DIGIT_COPY=5 };
+    enum EscState { ESC_NONE=0, ESC_SEEN00=1, ESC_SPACE=2, ESC_NL=3, ESC_DIGIT_LEN=4, ESC_DIGIT_COPY=5, ESC_DASH=6, ESC_EQUAL=7 };
     EscState esc = ESC_NONE; size_t digit_left = 0;
 
-    void reset() { hdr_pos = 0; header_done = false; transforms = false; esc = ESC_NONE; digit_left = 0; }
+    void reset() { hdr_pos = 0; hdr_need = 8; header_done = false; transforms = false; have_magic = false; flags = 0; esc = ESC_NONE; digit_left = 0; }
 
     bool feed(const unsigned char* in, size_t n, FILE* fout, uint32_t& crc, uint64_t& written) {
         size_t i = 0;
         while (i < n) {
             // Header state
             if (!header_done) {
+                // Accumulate up to magic first
                 while (hdr_pos < 4 && i < n) hdr[hdr_pos++] = in[i++];
-                if (hdr_pos >= 4 && !header_done) {
-                    if (!(hdr[0]=='H' && hdr[1]=='P' && hdr[2]=='Z' && hdr[3]=='T')) {
-                        // No header: passthrough accumulated hdr bytes
+                if (hdr_pos >= 4 && !have_magic) {
+                    have_magic = (hdr[0]=='H' && hdr[1]=='P' && hdr[2]=='Z' && hdr[3]=='T');
+                    if (!have_magic) {
+                        // No HPZT header: passthrough accumulated bytes
                         if (std::fwrite(hdr, 1, hdr_pos, fout) != hdr_pos) return false;
                         crc = crc32_update(crc, hdr, hdr_pos); written += hdr_pos;
-                        header_done = true; transforms = false; // passthrough mode
-                        // continue processing remaining in passthrough mode in same call
-                    } else {
-                        // HPZT present: need 4 more bytes (ver, flags, pad)
-                        while (hdr_pos < 8 && i < n) hdr[hdr_pos++] = in[i++];
-                        if (hdr_pos < 8) return true;
-                        header_done = true; transforms = (hdr[5] & 0x0F) != 0;
-                        continue;
+                        header_done = true; transforms = false; // passthrough mode for remainder
                     }
+                }
+                if (!header_done && have_magic) {
+                    // Need at least v1 base header (8 bytes)
+                    while (hdr_pos < 8 && i < n) hdr[hdr_pos++] = in[i++];
+                    if (hdr_pos < 8) return true; // wait for more
+                    // Decide on header length by version
+                    uint8_t ver = hdr[4]; flags = hdr[5];
+                    transforms = (flags & 0x3F) != 0; // accept any of the 6 defined transforms
+                    hdr_need = 8;
+                    if (ver >= 2) hdr_need = 12; // v2 adds 4-byte dict CRC
+                    while (hdr_pos < hdr_need && i < n) hdr[hdr_pos++] = in[i++];
+                    if (hdr_pos < hdr_need) return true; // wait for more
+                    // Validate dict CRC if v2
+                    if (hdr_need >= 12 && transforms) {
+                        uint32_t expect = read_le32(hdr + 8);
+                        uint32_t got = hpzt_dict_crc32();
+                        if (expect != got) {
+                            std::fprintf(stderr, "[ERROR] HPZT dict CRC mismatch: expected 0x%08x, got 0x%08x\n", expect, got);
+                            return false;
+                        }
+                    }
+                    header_done = true;
                 }
                 if (!header_done) continue;
             }
@@ -112,8 +106,12 @@ struct TransformDecoder {
                     esc = ESC_NL;
                 } else if (b == 0x82) {
                     esc = ESC_DIGIT_LEN;
-                } else if (b >= 1 && b <= DICT_SIZE) {
-                    const char* s = DICT[b - 1]; size_t L = std::strlen(s);
+                } else if (b == 0x83) {
+                    esc = ESC_DASH;
+                } else if (b == 0x84) {
+                    esc = ESC_EQUAL;
+                } else if (b >= 1 && b <= HPZT_DICT_SIZE) {
+                    const char* s = HPZT_DICT[b - 1]; size_t L = std::strlen(s);
                     if (L) { if (std::fwrite(s, 1, L, fout) != L) return false; crc = crc32_update(crc, (const unsigned char*)s, L); written += L; }
                     esc = ESC_NONE;
                 } else {
@@ -131,11 +129,18 @@ struct TransformDecoder {
                 digit_left = (size_t)b + 3; esc = ESC_DIGIT_COPY;
             } else if (esc == ESC_DIGIT_COPY) {
                 size_t can = std::min(digit_left, n - (i - 1)); // include current b already fetched
-                // We already consumed one byte into b; put it back logically
                 i--; // step back to include b in bulk copy
                 const unsigned char* src = in + i;
                 if (std::fwrite(src, 1, can, fout) != can) return false; crc = crc32_update(crc, src, can); written += can; i += can; digit_left -= can;
                 if (digit_left == 0) esc = ESC_NONE;
+            } else if (esc == ESC_DASH) {
+                size_t run = (size_t)b + 4; std::vector<unsigned char> ds(run, (unsigned char)'-');
+                if (!ds.empty()) { if (std::fwrite(ds.data(), 1, ds.size(), fout) != ds.size()) return false; crc = crc32_update(crc, ds.data(), ds.size()); written += ds.size(); }
+                esc = ESC_NONE;
+            } else if (esc == ESC_EQUAL) {
+                size_t run = (size_t)b + 5; std::vector<unsigned char> eq(run, (unsigned char)'=');
+                if (!eq.empty()) { if (std::fwrite(eq.data(), 1, eq.size(), fout) != eq.size()) return false; crc = crc32_update(crc, eq.data(), eq.size()); written += eq.size(); }
+                esc = ESC_NONE;
             }
         }
         return true;

@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-./build.sh
+# Ensure local scripts are executable when present (best-effort)
+[ -f build.sh ] && chmod +x build.sh || true
+[ -f verify.sh ] && chmod +x verify.sh || true
+[ -f measure.sh ] && chmod +x measure.sh || true
+
+# Build (invoke via bash to avoid reliance on executable bit)
+bash build.sh
 
 # Acquire data if missing
 if [ ! -f enwik9 ]; then
@@ -55,7 +61,7 @@ else
   exit 1
 fi
 
-# Sizes
+# Sizes (portable stat fallback)
 S1=$(stat -c%s comp 2>/dev/null || stat -f%z comp)
 S2=$(stat -c%s archive 2>/dev/null || stat -f%z archive)
 S=$((S1+S2))
