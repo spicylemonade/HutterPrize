@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-./build.sh
+# Always invoke build via bash to avoid permission-bit issues
+bash ./build.sh
+
+# Run lightweight self-tests first
+if [ -x ./selftest ]; then
+  echo "[INFO] Running selftest..." >&2
+  ./selftest
+  echo "[OK] selftest passed" >&2
+fi
 
 # Acquire data if missing
 if [ ! -f enwik9 ]; then
@@ -56,12 +64,27 @@ else
 fi
 
 # Sizes
-S1=$(stat -c%s comp 2>/dev/null || stat -f%z comp)
-S2=$(stat -c%s archive 2>/dev/null || stat -f%z archive)
+if stat -c%s comp >/dev/null 2>&1; then
+  S1=$(stat -c%s comp)
+  S2=$(stat -c%s archive)
+else
+  S1=$(stat -f%z comp)
+  S2=$(stat -f%z archive)
+fi
 S=$((S1+S2))
 L=110793128
 T=109685196
 
-echo "S1 (comp):   ${S1}"
+echo "S1 (comp):    ${S1}"
 echo "S2 (archive): ${S2}"
 echo "S  (total):   ${S} (threshold L=${L}, 1%=${T})"
+if [ ${S} -lt ${L} ]; then
+  echo "[INFO] S < L (record threshold)"
+else
+  echo "[INFO] S >= L (not yet a record)"
+fi
+if [ ${S} -le ${T} ]; then
+  echo "[INFO] S <= 0.99*L (>=1% improvement)."
+else
+  echo "[INFO] S > 0.99*L (not yet prize-eligible)."
+fi
