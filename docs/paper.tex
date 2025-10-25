@@ -6,33 +6,48 @@
 \usepackage{booktabs}
 \usepackage{siunitx}
 \usepackage{enumitem}
-\title{Towards a New Hutter Prize Record on enwik9: System Design and Implementation}
+\title{A Robust Self-Extracting Baseline for enwik9: Reversible Transforms + ZLIB}
 \author{HutterPrize Solver Authors}
 \date{\today}
 \begin{document}
 \maketitle
 \begin{abstract}
-Iteration 5 extends the reversible streaming transform layer with newline and digit run encoding in addition to dictionary tokenization and space-run encoding. We add CLI knobs to choose the compression backend (zlib or store) and to toggle transforms. The build remains dependency-free (dynamic zlib is loaded at runtime if available), and the self-extracting archive continues to be a single binary that reproduces enwik9 bit-identically. These changes deliver measurable S2 gains with zlib and strengthen the pipeline for future integration of a stronger backend and advanced modeling.
+We deliver a correct, robust, and testable baseline for the Hutter Prize enwik9 challenge. The system implements a self-extracting archive with a reversible streaming transform layer (dictionary tokenization, space/newline/digit/hex run encoding, and 0x00 escape) and a zlib backend. We fix prior correctness issues by centralizing the dictionary and adding a versioned transform header (HPZT v2) with a dictionary checksum verified by the decoder. Per-transform flags are declared in the payload header and enforced during decoding. Verification includes unit-like round-trip tests, chunk-boundary cases, and full enwik9 reproduction. While zlib is not competitive with the state-of-the-art total size, this foundation is engineered for integrating a stronger backend.
 \end{abstract}
 
-\section{Self-Extracting Format}
-We concatenate a decompressor stub with a payload and an HPZ2 footer (magic, method byte, original size, payload size, CRC-32 of original). When transforms are enabled, the payload starts with an 8-byte HPZT header (magic ``HPZT'', version=1, flags) that declares active transforms.
+\section{Format and Pipeline}
+We build two executables: \texttt{comp} (compressor) and \texttt{archive} (self-extracting decompressor). The compressor writes:
+\begin{enumerate}[noitemsep]
+  \item a decompressor stub (the \texttt{archive} program logic),
+  \item a payload (optionally transformed and then compressed), and
+  \item an HPZ2 footer: magic, method, original size, payload size, CRC-32 of the original.
+\end{enumerate}
+If transforms are enabled, the payload starts with an HPZT header.
 
-\section{Transforms}
+\paragraph{HPZT v2 Header.} Magic \texttt{HPZT}, version=2, a flags bitmask, padding, and a 32-bit little-endian checksum of the shared dictionary (including NUL separators). The decoder validates the checksum if the dictionary transform is enabled and rejects any token inconsistent with the declared flags. Unrecognized header versions degrade to passthrough.
+
+\section{Reversible Transforms}
+All transforms are streaming and strictly invertible:
 \begin{itemize}[noitemsep]
-  \item Dictionary tokenization: frequent XML/Wikitext substrings are replaced by two-byte tokens (0x00, id).
-  \item Space-run encoding: runs of spaces of length \(\ge 4\) are replaced by 0x00, 0x80, len$-$4.
-  \item Newline-run encoding (new): runs of newlines of length \(\ge 2\) are replaced by 0x00, 0x81, len$-$2.
-  \item Digit-run encoding (new): runs of digits of length \(\ge 3\) are replaced by 0x00, 0x82, len$-$3 followed by the digit bytes (saving one byte per run and improving compressibility).
-  \item Escape: literal 0x00 is encoded as 0x00, 0x00.
+  \item Dictionary tokenization: frequent XML/Wikitext substrings mapped to two-byte tokens (0x00, id). The dictionary is shared via a single header and checksummed.
+  \item Space-run: runs of spaces $\ge 4$ encoded as 0x00, 0x80, len$-$4.
+  \item Newline-run: runs of newlines $\ge 2$ encoded as 0x00, 0x81, len$-$2.
+  \item Digit-run: runs of digits $\ge 3$ encoded as 0x00, 0x82, len$-$3, followed by the digit bytes.
+  \item Hex-run: runs of hex digits [0--9A--Fa--f] $\ge 3$ encoded as 0x00, 0x83, len$-$3, followed by the run bytes.
+  \item Escape: literal 0x00 encoded as 0x00, 0x00.
 \end{itemize}
-All transforms are streaming and strictly reversible; decoding is driven by a simple finite-state machine.
+The compressor exposes \texttt{--transforms=LIST} to select any subset from \{dict, space, nl, digits, hex\}. The decoder enforces the bitmask to guarantee consistency.
 
-\section{Compression Backend and CLI}
-We use dynamic zlib (loaded at runtime) when available and fall back to STORE otherwise. The compressor now supports:\\
-\texttt{--method=zlib|store} and \texttt{--no-transform}. This enables controlled experiments and ablations.
+\section{Correctness and Validation}
+We corrected a prior bug (encoder/decoder dictionary skew) by centralizing the dictionary and introducing an HPZT v2 checksum guard. The verification script runs small round-trip tests (STORE and ZLIB) with transform ablations and chunk-boundary stress cases. It then executes the full enwik9 pipeline and validates bit-identity (size and CRC).
 
-\section{Roadmap}
-Next iterations will vendor a stronger bundled backend (e.g., LZMA or a static entropy coder) and introduce additional reversible transforms (numeric/date canonicalization and structural tagging), then integrate a context-mixing model. The final paper will include detailed ablations.
+\section{Engineering Notes}
+We load zlib dynamically (\texttt{dlopen}) with a STORE fallback; build scripts mark executables explicitly to avoid permission issues. The decoder treats unrecognized HPZT versions as no-header passthrough to avoid false positives. The code targets a single CPU core and modest memory.
+
+\section{Limitations and Roadmap}
+Deflate is not strong enough to beat the current record. To approach prize levels we plan to integrate a context-mixing backend (cmix-class) and expand reversible preprocessing (structural tagging, canonicalization, learned phrase models), keeping the decoder self-contained.
+
+\section{Reproducibility}
+Build with \texttt{bash build.sh}, produce \texttt{archive} via \texttt{./comp enwik9 archive}, decompress with \texttt{./archive}, and validate with \texttt{cmp enwik9 enwik9.out}. The repository includes scripts (\texttt{verify.sh}, \texttt{measure.sh}) and is licensed under an OSI-approved license.
 
 \end{document}
