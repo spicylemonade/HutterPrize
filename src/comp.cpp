@@ -3,16 +3,26 @@
 #include <cstdint>
 #include <cstring>
 #include <cerrno>
+#include <cctype>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "dlz.h"
+#include "transform_dict.h"
 
 static constexpr size_t IN_CHUNK  = 1 << 20; // 1 MiB
 static constexpr size_t OUT_CHUNK = 1 << 20; // 1 MiB
 static constexpr size_t TBUF_FLUSH = 1 << 16; // 64 KiB
+
+// Transform flags (bit positions)
+// bit0=DICT, bit1=SPACE-RUN, bit2=NL-RUN, bit3=DIGIT-RUN, bit4=HEX-RUN
+static constexpr uint8_t TFLAG_DICT  = 1u << 0;
+static constexpr uint8_t TFLAG_SPACE = 1u << 1;
+static constexpr uint8_t TFLAG_NL    = 1u << 2;
+static constexpr uint8_t TFLAG_DIGIT = 1u << 3;
+static constexpr uint8_t TFLAG_HEX   = 1u << 4;
 
 enum Method : uint8_t { METHOD_STORE = 0, METHOD_ZLIB = 1 };
 
@@ -41,251 +51,167 @@ static uint32_t crc32_update(uint32_t crc, const unsigned char* data, size_t len
     crc ^= 0xFFFFFFFFu; for (size_t i = 0; i < len; ++i) crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8); return crc ^ 0xFFFFFFFFu;
 }
 
-// Static dictionary of common XML/Wikitext tokens (<=127 entries)
-static const char* const DICT[] = {
-    "<page>", "</page>", "<title>", "</title>", "<id>", "</id>",
-    "<revision>", "</revision>", "<timestamp>", "</timestamp>",
-    "<contributor>", "</contributor>", "<username>", "</username>",
-    "<minor/>", "<minor />", "<comment>", "</comment>",
-    "<model>wikitext</model>", "<format>text/x-wiki</format>",
-    "<ns>", "</ns>", "<siteinfo>", "</siteinfo>",
-    "<sitename>", "</sitename>", "<base>", "</base>",
-    "<generator>", "</generator>", "<case>", "</case>",
-    "<namespaces>", "</namespaces>", "<namespace key=\"", "</namespace>",
-    "<mediawiki", "</mediawiki>",
-    "<text xml:space=\"preserve\">", "</text>", "<text ",
-    "[[", "]]", "{{", "}}", "[[Category:", "[[File:", "[[Image:",
-    "<ref>", "</ref>", "<ref", "<!--", "-->",
-    "==", "===", "====", "{{cite", "{{citation", "|author", "|title",
-    "|url", "|publisher", "|date", "|accessdate", "|work", "|pages",
-    "|isbn", "|doi", "|issue", "|volume", "|journal", "|language",
-    "|archiveurl", "|archivedate", "|quote", "|trans-title", "|location",
-    "|ref", "|last", "|first",
-    // Additional common markers
-    "|year", "|month", "|day", "|access-date", "|access-date=",
-    "[[Category:", "{{Infobox", "{{infobox", "<redirect", "#REDIRECT"
-};
-static constexpr int DICT_SIZE = (int)(sizeof(DICT)/sizeof(DICT[0]));
+// Compute a checksum of the shared dictionary (strings + NUL separators)
+static uint32_t hpzt_dict_crc32() {
+    uint32_t c = 0u;
+    for (int i = 0; i < HPZT_DICT_SIZE; ++i) {
+        const unsigned char* s = (const unsigned char*)HPZT_DICT[i];
+        size_t L = std::strlen(HPZT_DICT[i]);
+        c = crc32_update(c, s, L + 1);
+    }
+    return c;
+}
+
+// Transform flags parsing utilities
+static inline std::string to_lower(std::string s) { for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch); return s; }
+static inline std::string trim(const std::string& s) { size_t a=0,b=s.size(); while(a<b && (unsigned char)s[a] <= ' ') ++a; while(b>a && (unsigned char)s[b-1] <= ' ') --b; return s.substr(a,b-a); }
+static bool parse_transform_flags(const char* arg, uint8_t& out_flags) {
+    if (!arg || !*arg) { out_flags = (TFLAG_DICT|TFLAG_SPACE|TFLAG_NL|TFLAG_DIGIT|TFLAG_HEX); return true; }
+    std::string s = trim(to_lower(arg));
+    if (s == "all" || s == "default") { out_flags = (TFLAG_DICT|TFLAG_SPACE|TFLAG_NL|TFLAG_DIGIT|TFLAG_HEX); return true; }
+    if (s == "none" || s == "off") { out_flags = 0; return true; }
+    uint8_t flags = 0; size_t start = 0;
+    while (start <= s.size()) {
+        size_t comma = s.find(',', start);
+        std::string tok = (comma == std::string::npos) ? s.substr(start) : s.substr(start, comma - start);
+        tok = trim(tok);
+        if (!tok.empty()) {
+            if (tok == "dict" || tok == "dictionary" || tok == "d") flags |= TFLAG_DICT;
+            else if (tok == "space" || tok == "spaces" || tok == "s") flags |= TFLAG_SPACE;
+            else if (tok == "nl" || tok == "newline" || tok == "newlines" || tok == "n" || tok == "linebreaks") flags |= TFLAG_NL;
+            else if (tok == "digit" || tok == "digits" || tok == "num" || tok == "nums" || tok == "numbers") flags |= TFLAG_DIGIT;
+            else if (tok == "hex" || tok == "hexes") flags |= TFLAG_HEX;
+            else { std::fprintf(stderr, "[ERROR] Unknown transform token '%s' in --transforms=...\n", tok.c_str()); return false; }
+        }
+        if (comma == std::string::npos) break; else start = comma + 1;
+    }
+    out_flags = flags; return true;
+}
+static std::string transforms_to_string(uint8_t flags) {
+    if (flags == 0) return std::string("none");
+    std::string s; bool first = true; auto add=[&](const char* n){ if(!first) s+=", "; s+=n; first=false; };
+    if (flags & TFLAG_DICT)  add("dict");
+    if (flags & TFLAG_SPACE) add("space");
+    if (flags & TFLAG_NL)    add("nl");
+    if (flags & TFLAG_DIGIT) add("digits");
+    if (flags & TFLAG_HEX)   add("hex");
+    return s;
+}
+
+static inline bool is_hex_digit(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
 
 struct DictIndex {
     std::vector<int> heads[256];
     size_t maxLen = 0;
     DictIndex() {
-        for (int i = 0; i < DICT_SIZE; ++i) {
-            const unsigned char c = (unsigned char)DICT[i][0];
+        for (int i = 0; i < HPZT_DICT_SIZE; ++i) {
+            const unsigned char c = (unsigned char)HPZT_DICT[i][0];
             heads[c].push_back(i);
-            size_t L = std::strlen(DICT[i]); if (L > maxLen) maxLen = L;
+            size_t L = std::strlen(HPZT_DICT[i]); if (L > maxLen) maxLen = L;
         }
         for (int c = 0; c < 256; ++c) {
-            std::sort(heads[c].begin(), heads[c].end(), [](int a, int b){ return std::strlen(DICT[a]) > std::strlen(DICT[b]); });
+            std::sort(heads[c].begin(), heads[c].end(), [](int a, int b){ return std::strlen(HPZT_DICT[a]) > std::strlen(HPZT_DICT[b]); });
         }
         if (maxLen == 0) maxLen = 1;
     }
 };
 
 struct Sink {
-    FILE* fout{};
-    Method method{METHOD_STORE};
-    z_stream strm{};
-    std::vector<unsigned char> z_out;
-    uint64_t* total_out{};
-    bool z_inited{false};
+    FILE* fout{}; Method method{METHOD_STORE}; z_stream strm{}; std::vector<unsigned char> z_out; uint64_t* total_out{}; bool z_inited{false};
 };
 
 static bool sink_init(Sink& s, Method m, FILE* fout, uint64_t* total_out) {
     s.fout = fout; s.method = m; s.total_out = total_out; s.z_inited = false;
-    if (m == METHOD_ZLIB) {
-        s.z_out.resize(OUT_CHUNK);
-        if (hpz_deflateInit2(&s.strm, 9, Z_DEFLATED, 15, 9, 0) != Z_OK) {
-            return false;
-        }
-        s.z_inited = true;
-    }
+    if (m == METHOD_ZLIB) { s.z_out.resize(OUT_CHUNK); if (hpz_deflateInit2(&s.strm, 9, Z_DEFLATED, 15, 9, 0) != Z_OK) return false; s.z_inited = true; }
     return true;
 }
-
 static bool sink_write(Sink& s, const unsigned char* data, size_t n) {
-    if (!n) return true;
-    if (s.method == METHOD_STORE) {
-        if (std::fwrite(data, 1, n, s.fout) != n) return false;
-        *s.total_out += n; return true;
-    }
-    s.strm.next_in = const_cast<unsigned char*>(data);
-    s.strm.avail_in = (uInt)n;
-    while (s.strm.avail_in > 0) {
-        s.strm.next_out = s.z_out.data();
-        s.strm.avail_out = (uInt)s.z_out.size();
-        int r = hpz_deflate(&s.strm, Z_NO_FLUSH);
-        if (r != Z_OK) return false;
-        size_t have = s.z_out.size() - s.strm.avail_out;
-        if (have) {
-            if (std::fwrite(s.z_out.data(), 1, have, s.fout) != have) return false;
-            *s.total_out += have;
-        }
-    }
+    if (!n) return true; if (s.method == METHOD_STORE) { if (std::fwrite(data, 1, n, s.fout) != n) return false; *s.total_out += n; return true; }
+    s.strm.next_in = const_cast<unsigned char*>(data); s.strm.avail_in = (uInt)n;
+    while (s.strm.avail_in > 0) { s.strm.next_out = s.z_out.data(); s.strm.avail_out = (uInt)s.z_out.size(); int r = hpz_deflate(&s.strm, Z_NO_FLUSH); if (r != Z_OK) return false; size_t have = s.z_out.size() - s.strm.avail_out; if (have) { if (std::fwrite(s.z_out.data(), 1, have, s.fout) != have) return false; *s.total_out += have; } }
     return true;
 }
-
 static bool sink_finish(Sink& s) {
     if (s.method == METHOD_STORE) return true;
-    for (;;) {
-        s.strm.next_out = s.z_out.data();
-        s.strm.avail_out = (uInt)s.z_out.size();
-        int r = hpz_deflate(&s.strm, Z_FINISH);
-        if (r != Z_OK && r != Z_STREAM_END) return false;
-        size_t have = s.z_out.size() - s.strm.avail_out;
-        if (have) {
-            if (std::fwrite(s.z_out.data(), 1, have, s.fout) != have) return false;
-            *s.total_out += have;
-        }
-        if (r == Z_STREAM_END) break;
-    }
-    if (s.z_inited) hpz_deflateEnd(&s.strm);
-    return true;
+    for (;;) { s.strm.next_out = s.z_out.data(); s.strm.avail_out = (uInt)s.z_out.size(); int r = hpz_deflate(&s.strm, Z_FINISH); if (r != Z_OK && r != Z_STREAM_END) return false; size_t have = s.z_out.size() - s.strm.avail_out; if (have) { if (std::fwrite(s.z_out.data(), 1, have, s.fout) != have) return false; *s.total_out += have; } if (r == Z_STREAM_END) break; }
+    if (s.z_inited) hpz_deflateEnd(&s.strm); return true;
 }
 
 // Reversible transform encoder with streaming output to sink
-// Tokens: 0x00 0x00 -> literal 0x00; 0x00 1..DICT_SIZE -> dictionary id
+// Tokens: 0x00 0x00 -> literal 0x00; 0x00 1..HPZT_DICT_SIZE -> dictionary id
 //         0x00 0x80 <L> -> space run of length (L+4)
 //         0x00 0x81 <L> -> newline run of length (L+2)
-//         0x00 0x82 <L> <digits...> -> digit run of length (L+3) followed by that many digit bytes
+//         0x00 0x82 <L> <digits...> -> digit run (L+3)
+//         0x00 0x83 <L> <hex...>    -> hex run (L+3)
 struct Encoder {
-    DictIndex idx;
-    std::string carry;
-    std::vector<unsigned char> tbuf;
-    Sink* sink;
-    Encoder(Sink* s) : sink(s) { tbuf.reserve(TBUF_FLUSH); }
-    void flush_tbuf() {
-        if (!tbuf.empty()) {
-            if (!sink_write(*sink, tbuf.data(), tbuf.size())) { std::fprintf(stderr, "[ERROR] sink_write failed while flushing transform buffer\n"); std::exit(1); }
-            tbuf.clear();
-        }
-    }
-    inline void emit_byte(unsigned char b) {
-        tbuf.push_back(b);
-        if (tbuf.size() >= TBUF_FLUSH) flush_tbuf();
-    }
-    inline void emit_data(const unsigned char* p, size_t n) {
-        if (n == 0) return;
-        if (tbuf.size() + n >= TBUF_FLUSH) flush_tbuf();
-        if (n >= TBUF_FLUSH) {
-            if (!sink_write(*sink, p, n)) { std::fprintf(stderr, "[ERROR] sink_write failed\n"); std::exit(1); }
-        } else {
-            tbuf.insert(tbuf.end(), p, p + n);
-        }
-    }
+    DictIndex idx; std::string carry; std::vector<unsigned char> tbuf; Sink* sink; uint8_t flags{TFLAG_DICT|TFLAG_SPACE|TFLAG_NL|TFLAG_DIGIT|TFLAG_HEX};
+    Encoder(Sink* s, uint8_t f) : sink(s), flags(f) { tbuf.reserve(TBUF_FLUSH); }
+    void flush_tbuf() { if (!tbuf.empty()) { if (!sink_write(*sink, tbuf.data(), tbuf.size())) { std::fprintf(stderr, "[ERROR] sink_write failed while flushing transform buffer\n"); std::exit(1); } tbuf.clear(); } }
+    inline void emit_byte(unsigned char b) { tbuf.push_back(b); if (tbuf.size() >= TBUF_FLUSH) flush_tbuf(); }
+    inline void emit_data(const unsigned char* p, size_t n) { if (!n) return; if (tbuf.size() + n >= TBUF_FLUSH) flush_tbuf(); if (n >= TBUF_FLUSH) { if (!sink_write(*sink, p, n)) { std::fprintf(stderr, "[ERROR] sink_write failed\n"); std::exit(1); } } else { tbuf.insert(tbuf.end(), p, p + n); } }
     inline void emit_token(uint8_t id) { emit_byte(0x00); emit_byte(id); }
-    inline void emit_spaces(size_t n) {
-        while (n >= 259) { emit_byte(0x00); emit_byte(0x80); emit_byte((unsigned char)(255)); n -= 259; }
-        if (n >= 4) { emit_byte(0x00); emit_byte(0x80); emit_byte((unsigned char)(n - 4)); }
-        else { for (size_t i = 0; i < n; ++i) emit_byte(' '); }
-    }
-    inline void emit_newlines(size_t n) {
-        while (n >= 257) { emit_byte(0x00); emit_byte(0x81); emit_byte((unsigned char)(255)); n -= 257; }
-        if (n >= 2) { emit_byte(0x00); emit_byte(0x81); emit_byte((unsigned char)(n - 2)); }
-        else { for (size_t i = 0; i < n; ++i) emit_byte('\n'); }
-    }
-    inline void emit_digits_run(const unsigned char* s, size_t n) {
-        // Encode runs >=3 as 0x00 0x82 (len-3) + digits (n bytes). Saves 1 byte for any n>=3.
-        while (n >= 3) {
-            size_t chunk = n;
-            if (chunk > 258) chunk = 258; // length byte max 255 -> len-3<=255 => len<=258
-            emit_byte(0x00); emit_byte(0x82); emit_byte((unsigned char)(chunk - 3));
-            emit_data(s, chunk);
-            s += chunk; n -= chunk;
-        }
-        // leftovers <3
-        for (size_t i = 0; i < n; ++i) emit_byte(s[i]);
-    }
+    inline void emit_spaces(size_t n) { while (n >= 259) { emit_byte(0x00); emit_byte(0x80); emit_byte((unsigned char)255); n -= 259; } if (n >= 4) { emit_byte(0x00); emit_byte(0x80); emit_byte((unsigned char)(n - 4)); } else { for (size_t i=0;i<n;++i) emit_byte(' '); } }
+    inline void emit_newlines(size_t n) { while (n >= 257) { emit_byte(0x00); emit_byte(0x81); emit_byte((unsigned char)255); n -= 257; } if (n >= 2) { emit_byte(0x00); emit_byte(0x81); emit_byte((unsigned char)(n - 2)); } else { for (size_t i=0;i<n;++i) emit_byte('\n'); } }
+    inline void emit_digits_run(const unsigned char* s, size_t n) { while (n >= 3) { size_t chunk = n; if (chunk > 258) chunk = 258; emit_byte(0x00); emit_byte(0x82); emit_byte((unsigned char)(chunk - 3)); emit_data(s, chunk); s += chunk; n -= chunk; } for (size_t i=0;i<n;++i) emit_byte(s[i]); }
+    inline void emit_hex_run(const unsigned char* s, size_t n) { while (n >= 3) { size_t chunk = n; if (chunk > 258) chunk = 258; emit_byte(0x00); emit_byte(0x83); emit_byte((unsigned char)(chunk - 3)); emit_data(s, chunk); s += chunk; n -= chunk; } for (size_t i=0;i<n;++i) emit_byte(s[i]); }
+    inline bool ishex(unsigned char c) const { return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'); }
     void process_block(const unsigned char* data, size_t n, bool final) {
-        std::string block; block.reserve(carry.size() + n);
-        block.append(carry); carry.clear();
-        if (data && n) block.append(reinterpret_cast<const char*>(data), n);
-        size_t reserve = final ? 0 : (idx.maxLen > 0 ? idx.maxLen - 1 : 0);
-        if (reserve > block.size()) reserve = 0;
-        size_t limit = block.size() - reserve;
-        const unsigned char* s = reinterpret_cast<const unsigned char*>(block.data());
-        size_t i = 0;
+        std::string block; block.reserve(carry.size() + n); block.append(carry); carry.clear(); if (data && n) block.append(reinterpret_cast<const char*>(data), n);
+        size_t reserve = 0; if (!final && (flags & TFLAG_DICT)) { reserve = (idx.maxLen > 0 ? idx.maxLen - 1 : 0); if (reserve > block.size()) reserve = 0; }
+        size_t limit = block.size() - reserve; const unsigned char* s = reinterpret_cast<const unsigned char*>(block.data()); size_t i = 0;
         while (i < limit) {
-            unsigned char c = s[i];
-            if (c == 0x00) { emit_byte(0x00); emit_byte(0x00); ++i; continue; }
-            // Dictionary match (longest first per head index)
-            const auto& cand = idx.heads[c];
-            bool matched = false;
-            for (int di : cand) {
-                const char* t = DICT[di]; size_t L = std::strlen(t);
-                if (i + L <= block.size() && std::memcmp(s + i, t, L) == 0) {
-                    emit_token((uint8_t)(di + 1)); i += L; matched = true; break;
-                }
+            unsigned char c = s[i]; if (c == 0x00) { emit_byte(0x00); emit_byte(0x00); ++i; continue; }
+            if (flags & TFLAG_DICT) {
+                const auto& cand = idx.heads[c]; bool matched = false;
+                for (int di : cand) { const char* t = HPZT_DICT[di]; size_t L = std::strlen(t); if (i + L <= block.size() && std::memcmp(s + i, t, L) == 0) { emit_token((uint8_t)(di + 1)); i += L; matched = true; break; } }
+                if (matched) continue;
             }
-            if (matched) continue;
-            // Space-run
-            if (c == ' ') {
-                size_t j = i; while (j < limit && s[j] == ' ') ++j; size_t run = j - i;
-                if (run >= 4) { emit_spaces(run); i = j; continue; }
-            }
-            // Newline-run
-            if (c == '\n') {
-                size_t j = i; while (j < limit && s[j] == '\n') ++j; size_t run = j - i;
-                if (run >= 2) { emit_newlines(run); i = j; continue; }
-            }
-            // Digit-run (0-9)
-            if (c >= '0' && c <= '9') {
-                size_t j = i; while (j < limit && s[j] >= '0' && s[j] <= '9') ++j; size_t run = j - i;
-                if (run >= 3) { emit_digits_run(s + i, run); i = j; continue; }
-            }
-            // Literal
+            if ((flags & TFLAG_SPACE) && c == ' ') { size_t j=i; while (j<limit && s[j]==' ') ++j; size_t run=j-i; if (run>=4) { emit_spaces(run); i=j; continue; } }
+            if ((flags & TFLAG_NL) && c == '\n') { size_t j=i; while (j<limit && s[j]=='\n') ++j; size_t run=j-i; if (run>=2) { emit_newlines(run); i=j; continue; } }
+            if ((flags & TFLAG_DIGIT) && c>='0' && c<='9') { size_t j=i; while (j<limit && s[j]>='0'&&s[j]<='9') ++j; size_t run=j-i; if (run>=3) { emit_digits_run(s+i, run); i=j; continue; } }
+            if ((flags & TFLAG_HEX) && ishex(c)) { size_t j=i; while (j<limit && ishex(s[j])) ++j; size_t run=j-i; if (run>=3) { emit_hex_run(s+i, run); i=j; continue; } }
             emit_byte(c); ++i;
         }
-        // Save carry
-        if (!final && reserve) carry.assign(block.data() + limit, reserve);
+        if (!final && reserve) carry.assign(block.data()+limit, reserve);
         if (final && block.size() > limit) {
-            // Process remaining bytes (no reserve)
-            const unsigned char* rem = reinterpret_cast<const unsigned char*>(block.data() + limit);
-            size_t rn = block.size() - limit;
-            size_t k = 0;
+            const unsigned char* rem = reinterpret_cast<const unsigned char*>(block.data() + limit); size_t rn = block.size() - limit; size_t k = 0;
             while (k < rn) {
                 unsigned char cc = rem[k];
                 if (cc == 0x00) { emit_byte(0x00); emit_byte(0x00); ++k; }
-                else if (cc == ' ') {
-                    size_t m = k; while (m < rn && rem[m] == ' ') ++m; size_t r = m - k;
-                    if (r >= 4) { emit_spaces(r); k = m; } else { emit_byte(' '); ++k; }
-                } else if (cc == '\n') {
-                    size_t m = k; while (m < rn && rem[m] == '\n') ++m; size_t r = m - k;
-                    if (r >= 2) { emit_newlines(r); k = m; } else { emit_byte('\n'); ++k; }
-                } else if (cc >= '0' && cc <= '9') {
-                    size_t m = k; while (m < rn && rem[m] >= '0' && rem[m] <= '9') ++m; size_t r = m - k;
-                    if (r >= 3) { emit_digits_run(rem + k, r); k = m; } else { emit_byte(rem[k]); ++k; }
-                } else {
-                    emit_byte(cc); ++k;
-                }
+                else if ((flags & TFLAG_SPACE) && cc == ' ') { size_t m=k; while (m<rn && rem[m]==' ') ++m; size_t r=m-k; if (r>=4) { emit_spaces(r); k=m; } else { emit_byte(' '); ++k; } }
+                else if ((flags & TFLAG_NL) && cc == '\n') { size_t m=k; while (m<rn && rem[m]=='\n') ++m; size_t r=m-k; if (r>=2) { emit_newlines(r); k=m; } else { emit_byte('\n'); ++k; } }
+                else if ((flags & TFLAG_DIGIT) && cc>='0' && cc<='9') { size_t m=k; while (m<rn && rem[m]>='0'&&rem[m]<='9') ++m; size_t r=m-k; if (r>=3) { emit_digits_run(rem+k, r); k=m; } else { emit_byte(rem[k]); ++k; } }
+                else if ((flags & TFLAG_HEX) && ishex(cc)) { size_t m=k; while (m<rn && ishex(rem[m])) ++m; size_t r=m-k; if (r>=3) { emit_hex_run(rem+k, r); k=m; } else { emit_byte(rem[k]); ++k; } }
+                else { emit_byte(cc); ++k; }
             }
         }
     }
 };
 
 static void print_usage(const char* argv0) {
-    std::fprintf(stderr, "Usage: %s [--method=zlib|store] [--no-transform] <enwik9 path> <archive out path>\n", argv0);
+    std::fprintf(stderr, "Usage: %s [--method=zlib|store] [--no-transform | --transforms=LIST] <enwik9 path> <archive out path>\n", argv0);
+    std::fprintf(stderr, "  LIST: 'all' (default), 'none', or comma-separated from {dict,space,nl,digits,hex}\n");
 }
 
 int main(int argc, char** argv) {
     if (argc < 3) { print_usage(argv[0]); return 2; }
 
-    // Parse optional flags
     Method method = dlz_available() ? METHOD_ZLIB : METHOD_STORE;
-    bool apply_transforms = true;
+    bool no_transform = false; uint8_t tflags = (TFLAG_DICT|TFLAG_SPACE|TFLAG_NL|TFLAG_DIGIT|TFLAG_HEX);
+
     int argi = 1;
     for (; argi < argc - 2; ++argi) {
         const char* a = argv[argi];
-        if (std::strcmp(a, "--no-transform") == 0) { apply_transforms = false; continue; }
-        if (std::strncmp(a, "--method=", 9) == 0) {
-            const char* m = a + 9;
-            if (!std::strcmp(m, "zlib")) method = METHOD_ZLIB; else if (!std::strcmp(m, "store")) method = METHOD_STORE; else { print_usage(argv[0]); return 2; }
-            continue;
-        }
+        if (std::strcmp(a, "--no-transform") == 0) { no_transform = true; continue; }
+        if (std::strncmp(a, "--transforms=", 13) == 0) { uint8_t f; if (!parse_transform_flags(a + 13, f)) return 2; tflags = f; continue; }
+        if (std::strncmp(a, "--method=", 9) == 0) { const char* m = a + 9; if (!std::strcmp(m, "zlib")) method = METHOD_ZLIB; else if (!std::strcmp(m, "store")) method = METHOD_STORE; else { print_usage(argv[0]); return 2; } continue; }
         break;
     }
     if (argc - argi != 2) { print_usage(argv[0]); return 2; }
+
+    bool apply_transforms = !no_transform && (tflags != 0);
 
     const char* in_path = argv[argi];
     const char* out_path = argv[argi+1];
@@ -307,7 +233,6 @@ int main(int argc, char** argv) {
         if (std::ferror(fstub)) { std::fprintf(stderr, "[ERROR] Reading stub failed (%s)\n", std::strerror(errno)); std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1; }
     }
 
-    // Validate zlib availability if requested
     if (method == METHOD_ZLIB && !dlz_available()) {
         std::fprintf(stderr, "[WARN] zlib not available at runtime; falling back to STORE.\n");
         method = METHOD_STORE;
@@ -315,42 +240,31 @@ int main(int argc, char** argv) {
 
     uint64_t total_in = 0, total_out = 0; uint32_t crc = 0u;
 
-    // Prepare sink
     Sink sink{};
     if (!sink_init(sink, method, fout, &total_out)) {
         if (method == METHOD_ZLIB) {
-            std::fprintf(stderr, "[WARN] deflateInit2 failed; using STORE.\n");
-            method = METHOD_STORE;
+            std::fprintf(stderr, "[WARN] deflateInit2 failed; using STORE.\n"); method = METHOD_STORE;
             if (!sink_init(sink, method, fout, &total_out)) { std::fprintf(stderr, "[ERROR] Sink init failed\n"); std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1; }
-        } else {
-            std::fprintf(stderr, "[ERROR] Sink init failed\n");
-            std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1;
-        }
+        } else { std::fprintf(stderr, "[ERROR] Sink init failed\n"); std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1; }
     }
 
     // Optional HPZT header when transforms enabled
     if (apply_transforms) {
-        unsigned char hdr[8]; hdr[0]='H'; hdr[1]='P'; hdr[2]='Z'; hdr[3]='T'; hdr[4]=1; // version
-        // flags: bit0=DICT, bit1=SPACE-RUN, bit2=NL-RUN, bit3=DIGIT-RUN
-        hdr[5]=0x0F; hdr[6]=0; hdr[7]=0;
+        unsigned char hdr[12]; hdr[0]='H'; hdr[1]='P'; hdr[2]='Z'; hdr[3]='T'; hdr[4]=2; hdr[5]= tflags & 0x1F; hdr[6]=0; hdr[7]=0;
+        uint32_t dcrc = hpzt_dict_crc32(); hdr[8]  = (unsigned char)(dcrc & 0xFF); hdr[9]  = (unsigned char)((dcrc >> 8) & 0xFF); hdr[10] = (unsigned char)((dcrc >> 16) & 0xFF); hdr[11] = (unsigned char)((dcrc >> 24) & 0xFF);
         if (!sink_write(sink, hdr, sizeof(hdr))) { std::fprintf(stderr, "[ERROR] Writing transform header failed\n"); std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1; }
     }
 
-    // Stream input -> transforms -> sink OR raw -> sink when transforms disabled
-    Encoder enc(&sink);
+    Encoder enc(&sink, tflags);
     std::vector<unsigned char> inbuf; inbuf.resize(IN_CHUNK);
     for (;;) {
         size_t n = std::fread(inbuf.data(), 1, inbuf.size(), fin);
         if (n > 0) {
-            crc = crc32_update(crc, inbuf.data(), n);
-            total_in += n;
+            crc = crc32_update(crc, inbuf.data(), n); total_in += n;
             if (apply_transforms) enc.process_block(inbuf.data(), n, false);
             else if (!sink_write(sink, inbuf.data(), n)) { std::fprintf(stderr, "[ERROR] sink_write failed\n"); std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1; }
         }
-        if (n < inbuf.size()) {
-            if (std::ferror(fin)) { std::fprintf(stderr, "[ERROR] Reading input failed (%s)\n", std::strerror(errno)); std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1; }
-            break;
-        }
+        if (n < inbuf.size()) { if (std::ferror(fin)) { std::fprintf(stderr, "[ERROR] Reading input failed (%s)\n", std::strerror(errno)); std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1; } break; }
     }
 
     if (apply_transforms) { enc.process_block(nullptr, 0, true); enc.flush_tbuf(); }
@@ -363,18 +277,16 @@ int main(int argc, char** argv) {
         if (std::fwrite(magic2, 1, 4, fout) != 4) { std::fprintf(stderr, "[ERROR] Writing footer magic failed (%s)\n", std::strerror(errno)); std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1; }
         unsigned char method_and_pad[4] = { (unsigned char)method, 0, 0, 0 };
         if (std::fwrite(method_and_pad, 1, 4, fout) != 4) { std::fprintf(stderr, "[ERROR] Writing footer method failed (%s)\n", std::strerror(errno)); std::fclose(fin); std::fclose(fstub); std::fclose(fout); return 1; }
-        write_le64(fout, total_in);
-        write_le64(fout, total_out);
-        write_le32(fout, crc);
+        write_le64(fout, total_in); write_le64(fout, total_out); write_le32(fout, crc);
     }
 
-    std::fclose(fin); std::fclose(fstub);
-    if (std::fclose(fout) != 0) { std::fprintf(stderr, "[ERROR] Closing archive failed (%s)\n", std::strerror(errno)); return 1; }
+    std::fclose(fin); std::fclose(fstub); if (std::fclose(fout) != 0) { std::fprintf(stderr, "[ERROR] Closing archive failed (%s)\n", std::strerror(errno)); return 1; }
 
     chmod(out_path, 0755);
+    std::string tfstr = transforms_to_string(tflags);
     std::fprintf(stderr, "[OK] Created archive: %s\n", out_path);
     std::fprintf(stderr, " Method:     %s\n", method == METHOD_ZLIB ? "ZLIB" : "STORE");
-    std::fprintf(stderr, " Transforms: %s\n", apply_transforms ? "HPZT (dict,space,nl,digits)" : "none");
+    std::fprintf(stderr, " Transforms: %s\n", apply_transforms ? tfstr.c_str() : "none");
     std::fprintf(stderr, " Original:   %llu bytes\n", (unsigned long long) total_in);
     std::fprintf(stderr, " Payload:    %llu bytes\n", (unsigned long long) total_out);
     return 0;
