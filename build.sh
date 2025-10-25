@@ -10,4 +10,7 @@ mkdir -p src src/third_party docs
 ${CXX} ${CFLAGS} -Isrc -o archive_stub src/archive_main.cpp src/dlz.cpp ${LDFLAGS}
 ${CXX} ${CFLAGS} -Isrc -o comp         src/comp.cpp         src/dlz.cpp ${LDFLAGS}
 
-echo "[OK] Built comp and archive_stub (dynamic zlib; STORE fallback)."
+# Build selftest (no zlib needed)
+${CXX} ${CFLAGS} -Isrc -o selftest src/selftest.cpp ${LDFLAGS}
+
+echo "[OK] Built comp, archive_stub, and selftest (dynamic zlib; STORE fallback)."
