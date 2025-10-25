@@ -1,38 +1,27 @@
 \documentclass[11pt]{article}
 \usepackage[a4paper,margin=1in]{geometry}
 \usepackage{hyperref}
-\usepackage{graphicx}
 \usepackage{listings}
-\usepackage{booktabs}
-\usepackage{siunitx}
-\usepackage{enumitem}
-\title{Towards a New Hutter Prize Record on enwik9: System Design and Implementation}
-\author{HutterPrize Solver Authors}
-\date{\today}
-\begin{document}
-\maketitle
-\begin{abstract}
-Iteration 5 extends the reversible streaming transform layer with newline and digit run encoding in addition to dictionary tokenization and space-run encoding. We add CLI knobs to choose the compression backend (zlib or store) and to toggle transforms. The build remains dependency-free (dynamic zlib is loaded at runtime if available), and the self-extracting archive continues to be a single binary that reproduces enwik9 bit-identically. These changes deliver measurable S2 gains with zlib and strengthen the pipeline for future integration of a stronger backend and advanced modeling.
-\end{abstract}
-
-\section{Self-Extracting Format}
-We concatenate a decompressor stub with a payload and an HPZ2 footer (magic, method byte, original size, payload size, CRC-32 of original). When transforms are enabled, the payload starts with an 8-byte HPZT header (magic ``HPZT'', version=1, flags) that declares active transforms.
-
-\section{Transforms}
-\begin{itemize}[noitemsep]
-  \item Dictionary tokenization: frequent XML/Wikitext substrings are replaced by two-byte tokens (0x00, id).
-  \item Space-run encoding: runs of spaces of length \(\ge 4\) are replaced by 0x00, 0x80, len$-$4.
-  \item Newline-run encoding (new): runs of newlines of length \(\ge 2\) are replaced by 0x00, 0x81, len$-$2.
-  \item Digit-run encoding (new): runs of digits of length \(\ge 3\) are replaced by 0x00, 0x82, len$-$3 followed by the digit bytes (saving one byte per run and improving compressibility).
-  \item Escape: literal 0x00 is encoded as 0x00, 0x00.
-\end{itemize}
-All transforms are streaming and strictly reversible; decoding is driven by a simple finite-state machine.
-
-\section{Compression Backend and CLI}
-We use dynamic zlib (loaded at runtime) when available and fall back to STORE otherwise. The compressor now supports:\\
-\texttt{--method=zlib|store} and \texttt{--no-transform}. This enables controlled experiments and ablations.
-
-\section{Roadmap}
-Next iterations will vendor a stronger bundled backend (e.g., LZMA or a static entropy coder) and introduce additional reversible transforms (numeric/date canonicalization and structural tagging), then integrate a context-mixing model. The final paper will include detailed ablations.
-
+\usepackage{graphicx}
+\title{Hutter Prize (enwik9) Solver: HPZT Transforms and SFX Container}\author{HutterPrize Solver Authors}\date{\today}
+\begin{document}\maketitle
+\section*{Abstract}
+We describe a self-extracting archive pipeline for enwik9 with streaming, strictly reversible transforms (HPZT) and a pluggable backend. This document records design, correctness, resource use, and compression results as we iterate toward a context-mixing backend and record-class performance.
+\section{Dataset and Rules}
+Summary of enwik9 and prize constraints.\footnote{See README for authoritative references.}
+\section{Container and Formats}
+HPZ2 footer (magic, method, sizes, CRC). HPZT v2 header with dictionary CRC and transform bitflags (dict, space-run, newline-run, digit-run, dash-run, equals-run).
+\section{Transforms (HPZT)}
+Dictionary tokenization of common XML/Wikitext strings; space-run (\texttt{\ge}4), newline-run (\texttt{\ge}2), digit-run (\texttt{\ge}3), dash-run (\texttt{\ge}4), equals-run (\texttt{\ge}5). A shared dictionary and CRC guard prevent encoder/decoder skew. All transforms are streaming and strictly invertible with a simple FSM.
+\paragraph{Ablation Controls} For measurement, the compressor supports toggling individual transforms via CLI flags: \texttt{--no-dict}, \texttt{--no-space-run}, \texttt{--no-nl-run}, \texttt{--no-digit-run}, \texttt{--no-dash-run}, \texttt{--no-equals-run}, or \texttt{--no-transform} to disable all. The HPZT header records the active bitmask.
+\section{Backend}
+Current: deflate (zlib) with dynamic loading and STORE fallback. Roadmap: context mixing (cmix-class) or high-order models.
+\section{Correctness and Tests}
+Round-trip tests, boundary-straddling tests, CRC validation, and ablation sanity checks on synthetic samples.
+\section{Build and Resource Usage}
+Single-core, $<10\,\mathrm{GB}$ RAM, $<100\,\mathrm{GB}$ disk. Scripts: build.sh, verify.sh, measure.sh.
+\section{Results}
+Baseline sizes S1, S2, S; ablation results (transforms on/off, STORE). Future iterations will report context-mixing results.
+\section{Future Work}
+Heavier reversible transforms (structural tagging, canonicalization), context mixing backend integration, and final submission packaging.
 \end{document}
