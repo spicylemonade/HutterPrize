@@ -10,4 +10,6 @@ mkdir -p src src/third_party docs
 ${CXX} ${CFLAGS} -Isrc -o archive_stub src/archive_main.cpp src/dlz.cpp ${LDFLAGS}
 ${CXX} ${CFLAGS} -Isrc -o comp         src/comp.cpp         src/dlz.cpp ${LDFLAGS}
 
+chmod +x comp archive_stub || true
+
 echo "[OK] Built comp and archive_stub (dynamic zlib; STORE fallback)."
