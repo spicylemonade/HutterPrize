@@ -1,38 +1,145 @@
 \documentclass[11pt]{article}
-\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[margin=1in]{geometry}
 \usepackage{hyperref}
 \usepackage{graphicx}
 \usepackage{listings}
-\usepackage{booktabs}
-\usepackage{siunitx}
+\usepackage{inconsolata}
 \usepackage{enumitem}
-\title{Towards a New Hutter Prize Record on enwik9: System Design and Implementation}
-\author{HutterPrize Solver Authors}
-\date{\today}
+\lstset{basicstyle=\ttfamily\footnotesize,breaklines=true}
+
+\title{A Reversible Transform Pipeline for enwik9 with Self-Extracting Archive and Validation Harness}
+\author{Hutter Prize Solver Baseline Repository}
+\date{October 2025}
+
 \begin{document}
 \maketitle
+
 \begin{abstract}
-Iteration 5 extends the reversible streaming transform layer with newline and digit run encoding in addition to dictionary tokenization and space-run encoding. We add CLI knobs to choose the compression backend (zlib or store) and to toggle transforms. The build remains dependency-free (dynamic zlib is loaded at runtime if available), and the self-extracting archive continues to be a single binary that reproduces enwik9 bit-identically. These changes deliver measurable S2 gains with zlib and strengthen the pipeline for future integration of a stronger backend and advanced modeling.
+We present a correct, streaming, strictly-invertible preprocessing pipeline for the enwik9 dataset paired with a self-extracting archive format. The transform layer (HPZT) implements dictionary tokenization for common XML/Wikitext phrases, run-length encoding for spaces, newlines, and digit sequences, and literal NUL escaping. The payload is compressed using zlib (deflate) with a dynamic loader and STORE fallback. We fixed a correctness bug caused by encoder/decoder dictionary skew by unifying the dictionary into a shared header and added a dictionary checksum to the transform header (HPZT v2) to prevent skew regressions. We provide a robust validation harness, including unit tests, a streaming fuzz tester, and an archive introspection tool. As expected, a zlib backend is not competitive with the current Hutter Prize record; improving S1+S2 to record levels will require a context-mixing backend and heavier reversible transforms. This document details the format, implementation, verification, baseline results, and roadmap.
 \end{abstract}
 
-\section{Self-Extracting Format}
-We concatenate a decompressor stub with a payload and an HPZ2 footer (magic, method byte, original size, payload size, CRC-32 of original). When transforms are enabled, the payload starts with an 8-byte HPZT header (magic ``HPZT'', version=1, flags) that declares active transforms.
+\section{Overview}
+The Hutter Prize (enwik9) asks competitors to compress the first $10^9$ bytes of English Wikipedia (enwik9) into a self-extracting archive with total size $S = S_1 + S_2$ (compressor plus archive). The current record (Sept 2024) is $110{,}793{,}128$ bytes; prize eligibility requires a $\geq1\%$ improvement. This repository is a correctness-focused baseline implementing a reversible transform layer before deflate. While not competitive on size, it provides a sound foundation and a rigorous test harness for future backends and transforms.
 
-\section{Transforms}
-\begin{itemize}[noitemsep]
-  \item Dictionary tokenization: frequent XML/Wikitext substrings are replaced by two-byte tokens (0x00, id).
-  \item Space-run encoding: runs of spaces of length \(\ge 4\) are replaced by 0x00, 0x80, len$-$4.
-  \item Newline-run encoding (new): runs of newlines of length \(\ge 2\) are replaced by 0x00, 0x81, len$-$2.
-  \item Digit-run encoding (new): runs of digits of length \(\ge 3\) are replaced by 0x00, 0x82, len$-$3 followed by the digit bytes (saving one byte per run and improving compressibility).
-  \item Escape: literal 0x00 is encoded as 0x00, 0x00.
+\section{Format}
+\subsection{Self-extracting layout}
+The output file (archive) consists of:
+\begin{enumerate}[nosep]
+  \item Decompressor stub (\texttt{archive\_stub} binary image),
+  \item Payload (either STORE or zlib-compressed byte stream),
+  \item Footer: HPZ2 or HPZ1 (legacy). We write HPZ2.
+\end{enumerate}
+
+\subsection{HPZ2 footer}
+We use a 28-byte HPZ2 footer appended to the archive:
+\begin{itemize}[nosep]
+  \item Magic: \texttt{HPZ2} (4 bytes),
+  \item Method/pad: method byte (\texttt{0=STORE, 1=ZLIB}) + 3 pad bytes (4 bytes),
+  \item Original size (8 bytes, little-endian),
+  \item Payload size (8 bytes, little-endian),
+  \item CRC32 of original (4 bytes, polynomial 0xEDB88320).
 \end{itemize}
-All transforms are streaming and strictly reversible; decoding is driven by a simple finite-state machine.
+The decompressor locates the footer via file end, seeks to the payload, and streams decoding.
 
-\section{Compression Backend and CLI}
-We use dynamic zlib (loaded at runtime) when available and fall back to STORE otherwise. The compressor now supports:\\
-\texttt{--method=zlib|store} and \texttt{--no-transform}. This enables controlled experiments and ablations.
+\subsection{HPZT transform header}
+When transforms are enabled, the payload begins with an \textbf{HPZT} header:
+\begin{itemize}[nosep]
+  \item Magic: \texttt{HPZT} (4 bytes),
+  \item Version: 1 or 2 (1 byte),
+  \item Flags: bit0=DICT, bit1=SPACE-RUN, bit2=NL-RUN, bit3=DIGIT-RUN (1 byte),
+  \item V1: pad (2 bytes) total 8 bytes; V2: pad (1 byte) + dict\_crc32 (4 bytes, LE) total 12 bytes.
+\end{itemize}
+We write \textbf{HPZT v2} with a dictionary checksum; the decoder accepts v1 (no checksum) and v2 (with checksum). If the checksum in v2 does not match the compiled dictionary, the decoder aborts.
 
-\section{Roadmap}
-Next iterations will vendor a stronger bundled backend (e.g., LZMA or a static entropy coder) and introduce additional reversible transforms (numeric/date canonicalization and structural tagging), then integrate a context-mixing model. The final paper will include detailed ablations.
+\subsection{Transform bytecode}
+A streaming, FSM-style, invertible transform encodes:
+\begin{itemize}[nosep]
+  \item \textbf{Escape/literal NUL:} \texttt{0x00 0x00} encodes a literal \texttt{0x00}.
+  \item \textbf{Dictionary tokens:} \texttt{0x00 id} for \texttt{id} in \texttt{1..N}, where \texttt{N} is the number of dictionary entries. Each expands to a static string from the shared dictionary.
+  \item \textbf{Space runs:} \texttt{0x00 0x80 L} encodes \texttt{L+4} spaces, with chunking for long runs.
+  \item \textbf{Newline runs:} \texttt{0x00 0x81 L} encodes \texttt{L+2} newlines.
+  \item \textbf{Digit runs:} \texttt{0x00 0x82 L [digits...]} encodes \texttt{L+3} digit bytes copied verbatim after the length byte. Long runs are chunked.
+\end{itemize}
+The encoder only uses these codes when profitable (thresholds: spaces $\geq4$, newlines $\geq2$, digits $\geq3$). The decoder is a simple FSM (states: ESC\_NONE, ESC\_SEEN00, ESC\_SPACE, ESC\_NL, ESC\_DIGIT\_LEN, ESC\_DIGIT\_COPY).
+
+\section{Implementation}
+\subsection{Shared dictionary and checksum}
+We removed a duplicated dictionary entry that had caused encoder/decoder token ID skew and unified the dictionary into \texttt{src/hpzt\_dict.h}, shared by both \texttt{comp} and \texttt{archive\_stub}. A function \texttt{hpzt\_dict\_checksum()} computes an FNV-1a checksum (including a 0 delimiter per entry and the size), embedded into HPZT v2 header. The decoder validates the checksum before decoding.
+
+\subsection{Compressor}
+The compressor \texttt{comp}:
+\begin{enumerate}[nosep]
+  \item Copies \texttt{archive\_stub} to the output path,
+  \item Streams enwik9 through the transform encoder if enabled, updating CRC32,
+  \item Compresses via dynamically loaded zlib (or STORE fallback),
+  \item Appends an HPZ2 footer with method, sizes, and CRC32,
+  \item Marks the resulting archive executable.
+\end{enumerate}
+Command line: \texttt{./comp [--method=zlib|store] [--no-transform] <in> <out>}
+
+\subsection{Decompressor stub}
+The stub (\texttt{archive\_stub}) is a self-locating executable that:
+\begin{enumerate}[nosep]
+  \item Reads its own file size and HPZ2/HPZ1 footer,
+  \item Streams payload through zlib or STORE path into a transform decoder,
+  \item Validates CRC32 and size and writes \texttt{enwik9.out}.
+\end{enumerate}
+No network or external data is accessed at runtime.
+
+\subsection{Dynamic zlib loader}
+\texttt{src/dlz.*} resolves zlib symbols at runtime from common sonames (e.g., \texttt{libz.so.1}); if unavailable, the compressor falls back to STORE, and the decompressor aborts for \texttt{METHOD\_ZLIB} payloads without zlib.
+
+\section{Verification and Tests}
+We include a robust harness:
+\begin{itemize}[nosep]
+  \item \textbf{Unit self-test} (\texttt{hpzt\_selftest}): deterministic round-trips of the transform layer across edge cases, plus a negative test for checksum mismatch.
+  \item \textbf{Streaming fuzz test} (\texttt{hpzt\_stream\_fuzz}): randomized synthesis of inputs with NULs, runs, and dictionary tokens; variable chunk sizes verify streaming correctness and boundaries.
+  \item \textbf{Archive dump tool} (\texttt{hpzt\_dump}): prints footer, payload offset, HPZT header version/flags, and dictionary checksum comparison.
+  \item \textbf{Scripts}: \texttt{verify.sh} downloads data if needed, builds via \texttt{bash build.sh} (perm-robust), runs tests, compresses/decompresses, compares outputs, and prints sizes. \texttt{measure.sh} computes $S_1$, $S_2$, $S$ portably and optionally dumps archive info.
+\end{itemize}
+
+\subsection{Reproducible steps}
+\begin{lstlisting}[language=bash]
+# Build (robust to exec-bit issues)
+bash build.sh
+
+# Run tests
+./hpzt_selftest
+./hpzt_stream_fuzz 123456789 300
+
+# Acquire data and end-to-end verification
+bash verify.sh
+
+# Size measurement (portable stat)
+./comp enwik9 archive
+bash measure.sh
+# Optional details
+./hpzt_dump archive
+\end{lstlisting}
+
+\section{Results}
+Correctness: \texttt{cmp enwik9 enwik9.out} passes with transforms enabled and zlib backend (or STORE for testing). The HPZT v2 dictionary checksum prevents future encoder/decoder skew.
+
+Size baseline: With a zlib backend and these transforms, we expect $S_2 \approx 320$--$330$ MB (gzip-like) and $S_1$ on the order of a few hundred kilobytes, so $S \gg 110$ MB. This is not competitive with the current record $L = 110{,}793{,}128$.
+
+Performance: Implementation is single-threaded and streaming; memory is bounded by chunk buffers (MiB scale) and zlib state. Runtime fits within the published limits for end-to-end tasks on typical hardware.
+
+\section{Limitations and Roadmap}
+To become competitive, we will:
+\begin{enumerate}[nosep]
+  \item \textbf{Upgrade backend}: integrate a context-mixing compressor (cmix-class) or a modern high-order entropy coder with a deterministic, single-core decoder packed into the archive stub.
+  \item \textbf{Expand transforms}: structural tagging for Wikitext/XML (templates, refs, attributes, redirects), canonicalization (dates, numbers), larger mined phrase dictionaries (reconstructable deterministically), and compact schemas.
+  \item \textbf{Engineering}: deterministic builds, size audits for $S_1$/$S_2$, resource measurements, and thorough ablations of each transform versus final $S$.
+  \item \textbf{Packaging}: maintain OSI-licensed source, reproducible build scripts, and an audit trail for the 30-day public review window.
+\end{enumerate}
+
+\section{Security and Compliance}
+The decoder does not access network or external files; it only reads its own binary image and writes \texttt{enwik9.out}. The HPZT dictionary checksum guards against accidental skew. All code is released under the repository license; third-party dependencies are limited to the platform zlib runtime (or submission will vendor/static-link to avoid mismatches).
+
+\section{Conclusion}
+We delivered a correct, tested baseline for enwik9 with a reversible transform and a self-extracting archive format, ready for backend and transform research. The harness (self-tests, fuzzing, and dump utility) provides confidence in streaming correctness and safety. Future work will focus on modeling power to close the gap to the current record.
+
+\section*{Acknowledgments}
+Thanks to the community for public discussions of winning approaches and to maintainers of related tools.
 
 \end{document}

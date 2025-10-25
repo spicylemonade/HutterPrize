@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-./build.sh
+# Build via bash to avoid exec-bit issues
+bash build.sh
+
+# Run transform self-tests
+if [ -x ./hpzt_selftest ]; then
+  ./hpzt_selftest
+fi
+# Run streaming fuzz (bounded iterations)
+if [ -x ./hpzt_stream_fuzz ]; then
+  ./hpzt_stream_fuzz 123456789 300
+fi
 
 # Acquire data if missing
 if [ ! -f enwik9 ]; then
@@ -39,6 +49,12 @@ else
   $TS_PREFIX ./comp enwik9 archive
 fi
 
+# Introspect archive (optional)
+if [ -x ./hpzt_dump ]; then
+  echo "[INFO] Archive details:"
+  ./hpzt_dump archive || true
+fi
+
 # Decompress
 rm -f enwik9.out || true
 if [ -n "$TIME_CMD" ]; then
@@ -55,13 +71,5 @@ else
   exit 1
 fi
 
-# Sizes
-S1=$(stat -c%s comp 2>/dev/null || stat -f%z comp)
-S2=$(stat -c%s archive 2>/dev/null || stat -f%z archive)
-S=$((S1+S2))
-L=110793128
-T=109685196
-
-echo "S1 (comp):   ${S1}"
-echo "S2 (archive): ${S2}"
-echo "S  (total):   ${S} (threshold L=${L}, 1%=${T})"
+# Sizes and report (portable)
+bash measure.sh

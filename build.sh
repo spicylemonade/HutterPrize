@@ -7,7 +7,12 @@ LDFLAGS="-s -flto -Wl,--gc-sections -ldl"
 
 mkdir -p src src/third_party docs
 
-${CXX} ${CFLAGS} -Isrc -o archive_stub src/archive_main.cpp src/dlz.cpp ${LDFLAGS}
-${CXX} ${CFLAGS} -Isrc -o comp         src/comp.cpp         src/dlz.cpp ${LDFLAGS}
+${CXX} ${CFLAGS} -Isrc -o archive_stub     src/archive_main.cpp src/dlz.cpp ${LDFLAGS}
+${CXX} ${CFLAGS} -Isrc -o comp             src/comp.cpp         src/dlz.cpp ${LDFLAGS}
+# Self-test binaries for transform layer
+${CXX} ${CFLAGS} -Isrc -o hpzt_selftest    src/hpzt_selftest.cpp ${LDFLAGS}
+${CXX} ${CFLAGS} -Isrc -o hpzt_stream_fuzz src/hpzt_stream_fuzz.cpp ${LDFLAGS}
+# Archive introspection tool
+${CXX} ${CFLAGS} -Isrc -o hpzt_dump        src/hpzt_dump.cpp     src/dlz.cpp ${LDFLAGS}
 
-echo "[OK] Built comp and archive_stub (dynamic zlib; STORE fallback)."
+echo "[OK] Built comp, archive_stub, hpzt_selftest, hpzt_stream_fuzz, and hpzt_dump (dynamic zlib; STORE fallback)."
