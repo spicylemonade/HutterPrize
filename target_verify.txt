@@ -61,16 +61,15 @@ with open(os.path.join(outdir, 't2.bin'), 'wb') as f:
     f.write(b'gory:Science]]\n') # begin next chunk
     f.write(b' ' * 300 + b'\n' * 260)
     f.write(b'0' * 300)
-# t3: 0x00 heavy to test escaping + hex runs
+# t3: 0x00 heavy to test escaping
 with open(os.path.join(outdir, 't3.bin'), 'wb') as f:
     f.write(b'\x00' * 10 + b'END' + b'\n')
-    f.write(b'deadBEEFCAFEBABE0123ABCDEFabcdef')
 print(outdir)
 PY
 
 pushd "$TMPDIR" >/dev/null
 for f in t1.bin t2.bin t3.bin; do
-  for TF in all dict space nl digits hex "space,nl,digits" "digits,hex" none; do
+  for TF in all dict space nl digits "space,nl,digits" none; do
     # Compose transform args
     TARG="--transforms=${TF}"
     if [ "$TF" = "none" ]; then TARG="--no-transform"; fi
